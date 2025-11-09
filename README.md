@@ -2,7 +2,6 @@
 
 An intelligent AI-powered chatbot for laptop recommendations that understands both technical specifications and semantic preferences using advanced RAG (Retrieval-Augmented Generation) and LLM capabilities.
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
 ![React](https://img.shields.io/badge/react-19.2.0-blue.svg)
 ![FastAPI](https://img.shields.io/badge/fastapi-0.115.0-green.svg)
