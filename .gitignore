@@ -1,0 +1,67 @@
+# General OS files
+.DS_Store
+Thumbs.db
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.code-workspace
+*.iml
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.pyi
+*.so
+*.egg-info/
+.eggs/
+.build/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+coverage/
+htmlcov/
+
+# Environment and credentials
+.env
+.env.*
+*.env
+*.env.*
+
+# Application data & logs
+chat_logs/
+*.log
+logs/
+
+# Local databases and persistence
+*.db
+*.sqlite
+*.sqlite3
+chroma_data/
+
+# Node / frontend artifacts
+node_modules/
+.pnp/
+.pnp.js
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+frontend/build/
+frontend/.next/
+frontend/.turbo/
+
+# Docker
+*.pid
