@@ -560,6 +560,97 @@ class OferGPT:
             print(f"[SEMANTIC_EXTRACT] ERROR extracting semantic context: {e}")
             return ""
 
+    def _parse_ram_gb(self, ram_str: str) -> float:
+        """Parse RAM string to GB value."""
+        if not ram_str:
+            return 0.0
+        import re
+        match = re.search(r'(\d+(?:\.\d+)?)', str(ram_str).lower())
+        return float(match.group(1)) if match else 0.0
+    
+    def _parse_storage_gb(self, storage_str: str) -> float:
+        """Parse storage string to GB value."""
+        if not storage_str:
+            return 0.0
+        import re
+        storage_text = str(storage_str).lower()
+        match = re.search(r'(\d+(?:\.\d+)?)\s*(tb|gb)?', storage_text)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2)
+            return value * 1024 if unit == 'tb' else value
+        return 0.0
+    
+    def _score_products_by_specs(self, products: List[Dict[str, Any]], filter_prefs: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Score and sort products by how close they match the user's stated specs.
+        
+        Prioritizes products with specs closest to what the user asked for, not just minimum threshold.
+        
+        Args:
+            products: List of product dictionaries
+            filter_prefs: Dictionary with min_ram_gb, min_storage_gb, etc.
+        
+        Returns:
+            Sorted list of products (best matches first)
+        """
+        if not filter_prefs or not products:
+            return products
+        
+        def calculate_spec_score(product: Dict[str, Any]) -> float:
+            """Calculate how close a product matches the user's specs."""
+            score = 0.0
+            
+            # RAM scoring: prefer exact match, penalize excess
+            if 'min_ram_gb' in filter_prefs:
+                target_ram = filter_prefs['min_ram_gb']
+                # Parse RAM from product (try both _ram_gb and RAM fields)
+                product_ram = float(product.get('_ram_gb', 0)) or self._parse_ram_gb(product.get('RAM', ''))
+                if product_ram >= target_ram:
+                    # Exact match or close = high score, excess = lower score
+                    excess_ratio = (product_ram - target_ram) / target_ram if target_ram > 0 else 0
+                    ram_score = 1.0 / (1.0 + excess_ratio * 0.1)  # Penalize excess by 10% per GB over
+                    score += ram_score * 0.4  # RAM is 40% of score
+            
+            # Storage scoring: prefer exact match, penalize excess
+            if 'min_storage_gb' in filter_prefs:
+                target_storage = filter_prefs['min_storage_gb']
+                # Parse storage from product (try both _storage_gb and Storage fields)
+                product_storage = float(product.get('_storage_gb', 0)) or self._parse_storage_gb(product.get('Storage', ''))
+                if product_storage >= target_storage:
+                    # Exact match or close = high score, excess = lower score
+                    excess_ratio = (product_storage - target_storage) / target_storage if target_storage > 0 else 0
+                    storage_score = 1.0 / (1.0 + excess_ratio * 0.05)  # Penalize excess by 5% per GB over
+                    score += storage_score * 0.4  # Storage is 40% of score
+            
+            # Price scoring: prefer lower price (if specified)
+            if 'max_price' in filter_prefs:
+                product_price = float(product.get('_price', float('inf')))
+                max_price = filter_prefs['max_price']
+                if product_price <= max_price:
+                    # Lower price = higher score
+                    price_score = 1.0 - (product_price / max_price) * 0.5  # Max 50% discount for cheapest
+                    score += price_score * 0.2  # Price is 20% of score
+            
+            return score
+        
+        # Score all products
+        scored_products = []
+        for product in products:
+            score = calculate_spec_score(product)
+            scored_products.append((product, score))
+        
+        # Sort by score descending (best matches first)
+        scored_products.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log top matches with scores
+        print(f"[SPEC_SCORING] Top 3 products by spec match:")
+        for i, (product, score) in enumerate(scored_products[:3], 1):
+            ram_gb = self._parse_ram_gb(product.get('RAM', ''))
+            storage_gb = self._parse_storage_gb(product.get('Storage', ''))
+            print(f"[SPEC_SCORING]   {i}. {product.get('Name')} (RAM: {ram_gb}GB, Storage: {storage_gb}GB, score: {score:.3f})")
+        
+        return [product for product, _ in scored_products]
+    
     def _build_chromadb_where_filter(self, filter_prefs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Build ChromaDB where filter from preference dict.
         
@@ -760,7 +851,7 @@ Generate a natural, conversational response."""
         self.memory.chat_memory.add_ai_message(full_response)
     
     def _generate_clarification_response(self, query: str, preferences: Dict[str, Any], 
-                         semantic_context: str = "") -> Generator[str, None, None]:
+                         semantic_context: str = "", matching_products_count: int = 0) -> Generator[str, None, None]:
         """Generate a conversational response asking for clarification before recommendations.
         
         This is used during the early stages of conversation (before min_prompts_for_recommendation)
@@ -770,6 +861,7 @@ Generate a natural, conversational response."""
             query: Current user query
             preferences: Hard spec preferences gathered so far
             semantic_context: Accumulated semantic preferences (use cases, priorities)
+            matching_products_count: Number of products matching current preferences
         """
         # Determine what information we still need
         hard_spec_keys = ['brand', 'cpu', 'gpu', 'ram', 'storage', 'max_price']
@@ -792,6 +884,10 @@ Generate a natural, conversational response."""
         provided_specs = [k for k in hard_spec_keys if preferences.get(k)]
         
         # Build the prompt for the LLM to generate a natural clarification response
+        matching_info = ""
+        if matching_products_count > 0:
+            matching_info = f"\n\nIMPORTANT: We found {matching_products_count} laptops in our catalog that match the user's current specifications. You can mention this to reassure them that we have options, but don't show the full recommendations yet - just ask for more details to narrow down the best choice."
+        
         prompt = f"""You are a helpful AI assistant gathering information about the user's laptop needs.
 
 User's current query: {query}
@@ -799,12 +895,13 @@ User's current query: {query}
 {"User's priorities and use case: " + semantic_context if semantic_context else ""}
 
 Information we already have:
-{json.dumps(preferences, indent=2) if preferences else "None yet"}
+{json.dumps(preferences, indent=2) if preferences else "None yet"}{matching_info}
 
 Your task:
 1. Acknowledge what the user has told you so far
-2. Ask clarifying questions to understand their needs better
-3. Gather information about BOTH technical specs AND use-case preferences:
+2. If matching products were found, mention that we have options available
+3. Ask clarifying questions to understand their needs better and narrow down the best choice
+4. Gather information about BOTH technical specs AND use-case preferences:
 
    TECHNICAL SPECIFICATIONS:
    - Brand preference (e.g., Dell, HP, Lenovo)
@@ -1099,16 +1196,34 @@ Generate a natural response that continues the conversation naturally."""
                     )
                     print(f"\n=== FULL CONTEXT ===\n{full_context}\n===================\n")
             
-            # Detect user intent (only using current query, not full history to save tokens)
-            intent = self._detect_intent_llm(user_input)
-            self._last_detected_intent = intent  # Store for metrics tracking
-            print(f"Detected intent: {intent}")
+            # Increment product prompt counter early to check if we should defer expensive operations
+            # This allows us to accumulate preferences without making API calls during clarification phase
+            self.product_prompt_count += 1
+            print(f"[CHAT_FLOW] Product prompt count: {self.product_prompt_count}/{self.min_prompts_for_recommendation}")
+            
+            # Check if we're still in clarification phase (not enough prompts yet)
+            in_clarification_phase = self.product_prompt_count < self.min_prompts_for_recommendation
+            
+            # Only detect intent if we're past clarification phase or have accumulated preferences
+            # This saves API calls during the clarification phase
+            if in_clarification_phase and not self.accumulated_preferences and not self.accumulated_semantic_query:
+                # During clarification with no prior context, just ask clarifying questions
+                # without expensive intent detection
+                print(f"[CHAT_FLOW] In clarification phase with no prior context - deferring intent detection")
+                intent = 'preferences_given'  # Assume user is providing preferences
+            else:
+                # Detect user intent (only using current query, not full history to save tokens)
+                intent = self._detect_intent_llm(user_input)
+                self._last_detected_intent = intent  # Store for metrics tracking
+                print(f"Detected intent: {intent}")
             
             # Intent categories
             greeting_intents = ['greeting', 'chitchat', 'nonsense']
             preference_intents = ['preferences_given', 'recommendation_request', 'product_inquiry']
+            print(f"Accumulated semantic query: {self.accumulated_semantic_query}")
+            print(f"Accumulated preferences: {self.accumulated_preferences}")
             
-            if intent in greeting_intents:
+            if intent in greeting_intents and not self.accumulated_semantic_query and not self.accumulated_preferences:
                 # For greetings and small talk, just respond without product recommendations
                 print(f"Processing greeting/small talk: {intent}")
                 yield from self.stream_response_with_memory(
@@ -1121,33 +1236,43 @@ Generate a natural response that continues the conversation naturally."""
             if intent in preference_intents:
                 print(f"\n[CHAT_FLOW] Processing product intent: {intent}")
                 
-                # Increment product prompt counter
-                self.product_prompt_count += 1
-                print(f"[CHAT_FLOW] Product prompt count: {self.product_prompt_count}/{self.min_prompts_for_recommendation}")
-                
                 # Step 1a: Extract technical (hard spec) preferences using LLM
+                # Always extract hard specs so we can filter products, even during clarification
                 print(f"[CHAT_FLOW] Step 1a: Extracting hard spec preferences from user input")
                 new_preferences = self._extract_preferences(user_input)
                 print(f"[CHAT_FLOW] Step 1a result: {new_preferences if new_preferences else 'NO HARD SPECS FOUND'}")
                 
-                # Step 1b: Extract semantic context as free text
-                print(f"[CHAT_FLOW] Step 1b: Extracting semantic context from user input")
-                semantic_context = self._extract_semantic_context(user_input, full_context)
-                # Ensure semantic_context is a string
-                if semantic_context and not isinstance(semantic_context, str):
-                    semantic_context = str(semantic_context)
-                
-                if semantic_context:
-                    print(f"[CHAT_FLOW] Step 1b result: '{semantic_context}'")
-                    # Accumulate semantic context
-                    if self.accumulated_semantic_query:
-                        # Add with single space after period
-                        self.accumulated_semantic_query = f"{self.accumulated_semantic_query} {semantic_context}"
-                    else:
-                        self.accumulated_semantic_query = semantic_context
-                    print(f"[CHAT_FLOW] Accumulated semantic query: '{self.accumulated_semantic_query}'")
+                # Step 1b: Extract semantic context only if past clarification phase or have prior context
+                # Defer semantic extraction during clarification to save API calls
+                if in_clarification_phase and not self.accumulated_preferences and not self.accumulated_semantic_query:
+                    print(f"[CHAT_FLOW] In clarification phase - deferring semantic extraction to save API calls")
+                    semantic_context = ""
                 else:
-                    print(f"[CHAT_FLOW] Step 1b result: NO SEMANTIC CONTEXT FOUND")
+                    # Step 1b: Extract semantic context as free text
+                    print(f"[CHAT_FLOW] Step 1b: Extracting semantic context from user input")
+                    semantic_context = self._extract_semantic_context(user_input, full_context)
+                    # Ensure semantic_context is a string
+                    if semantic_context and not isinstance(semantic_context, str):
+                        semantic_context = str(semantic_context)
+                    
+                    if semantic_context:
+                        print(f"[CHAT_FLOW] Step 1b result: '{semantic_context}'")
+                    else:
+                        print(f"[CHAT_FLOW] Step 1b result: NO SEMANTIC CONTEXT FOUND")
+                
+                # Accumulate semantic context if found
+                if semantic_context:
+                    # Clean up empty semantic context (just quotes or whitespace)
+                    cleaned_context = semantic_context.strip().strip('"').strip()
+                    if cleaned_context:  # Only accumulate if not empty after cleaning
+                        if self.accumulated_semantic_query:
+                            # Add with single space after period
+                            self.accumulated_semantic_query = f"{self.accumulated_semantic_query} {cleaned_context}"
+                        else:
+                            self.accumulated_semantic_query = cleaned_context
+                        print(f"[CHAT_FLOW] Accumulated semantic query: '{self.accumulated_semantic_query}'")
+                    else:
+                        print(f"[CHAT_FLOW] Semantic context was empty after cleaning, skipping accumulation")
                 
                 # Step 2: Merge with accumulated preferences (remember what user already told us)
                 print(f"[CHAT_FLOW] Step 2: Merging with accumulated preferences")
@@ -1171,61 +1296,75 @@ Generate a natural response that continues the conversation naturally."""
                 semantic_matching_skus = []
                 filter_type = "semantic"  # Track which filtering method was used
                 
-                if self.product_prompt_count < self.min_prompts_for_recommendation:
-                    print(f"[CHAT_FLOW] Step 3b: Skipping semantic search (not enough prompts yet: {self.product_prompt_count}/{self.min_prompts_for_recommendation})")
-                else:
-                    print(f"[CHAT_FLOW] Step 3b: Querying embeddings for semantic similarity + hard spec filtering")
+                if in_clarification_phase:
+                    print(f"[CHAT_FLOW] Step 3b: In clarification phase ({self.product_prompt_count}/{self.min_prompts_for_recommendation}) - deferring semantic search")
                     
-                    if self.semantic_rag:
+                    # Fallback: If we have hard specs, use them to filter products even during clarification phase
+                    if filter_prefs and self.semantic_rag:
                         where_filter = self._build_chromadb_where_filter(filter_prefs)
+                        if where_filter:
+                            print(f"[CHAT_FLOW] Step 3b: Fallback - Using hard spec filters to find products")
+                            semantic_matching_skus = self.semantic_rag.filter_by_specs(where_filter, top_k=31)
+                            filter_type = "hard_specs"
+                            print(f"[CHAT_FLOW] Step 3b result: Found {len(semantic_matching_skus)} matches (hard specs only)")
+                else:
+                    # If we have semantic context, do semantic search + hard spec filtering
+                    # If we only have hard specs (no semantic context), skip semantic search and use hard specs only
+                    if self.accumulated_semantic_query:
+                        print(f"[CHAT_FLOW] Step 3b: Querying embeddings for semantic similarity + hard spec filtering")
                         
-                        # Determine query for semantic search and reranking
-                        # Use accumulated semantic query if available, otherwise use current input
-                        if self.accumulated_semantic_query:
+                        if self.semantic_rag:
+                            where_filter = self._build_chromadb_where_filter(filter_prefs)
+                            
+                            # Use accumulated semantic query for reranking
                             query_for_rerank = self.accumulated_semantic_query
                             print(f"[CHAT_FLOW] Using accumulated semantic query: '{query_for_rerank}'")
-                        else:
-                            query_for_rerank = user_input
-                            print(f"[CHAT_FLOW] No accumulated semantic context, using current query: '{user_input}'")
-                        
-                        # Decide whether to use reranking
-                        # Use reranking if we have semantic context accumulated
-                        use_rerank = bool(self.accumulated_semantic_query)
-                        
-                        # Query the user input directly against enriched embeddings
-                        # This works even without explicit semantic preferences
-                        # Returns list of tuples: [(sku, similarity), ...]
-                        semantic_matches = self.semantic_rag.find_semantic_matches(
-                            query=query_for_rerank,
-                            top_k=5,
-                            use_rerank=use_rerank
-                        )
+                            
+                            # Query the user input directly against enriched embeddings
+                            # This works even without explicit semantic preferences
+                            # Returns list of tuples: [(sku, similarity), ...]
+                            semantic_matches = self.semantic_rag.find_semantic_matches(
+                                query=query_for_rerank,
+                                top_k=5,
+                                use_rerank=True
+                            )
 
-                        # Extract just the SKUs from the tuples
-                        semantic_matching_skus = [sku for sku, _ in semantic_matches]
+                            # Extract just the SKUs from the tuples
+                            semantic_matching_skus = [sku for sku, _ in semantic_matches]
 
-                        # Filter results by hard specs
-                        spec_matching_skus: List[str] = []
-                        if where_filter:
-                            print(f"[CHAT_FLOW] Step 3b: Applying hard spec filters to semantic results")
-                            spec_matching_skus = self.semantic_rag.filter_by_specs(where_filter, top_k=5)
+                            # Filter results by hard specs
+                            spec_matching_skus: List[str] = []
+                            if where_filter:
+                                print(f"[CHAT_FLOW] Step 3b: Applying hard spec filters to semantic results")
+                                spec_matching_skus = self.semantic_rag.filter_by_specs(where_filter, top_k=5)
 
-                            if semantic_matching_skus:
-                                spec_sku_set = set(spec_matching_skus)
-                                # Keep only semantic results that also match hard specs (intersection)
-                                semantic_matching_skus = [sku for sku in semantic_matching_skus if sku in spec_sku_set]
                                 if semantic_matching_skus:
-                                    filter_type = "hybrid"  # Both semantic and hard specs matched
+                                    spec_sku_set = set(spec_matching_skus)
+                                    # Keep only semantic results that also match hard specs (intersection)
+                                    semantic_matching_skus = [sku for sku in semantic_matching_skus if sku in spec_sku_set]
+                                    if semantic_matching_skus:
+                                        filter_type = "hybrid"  # Both semantic and hard specs matched
 
-                            if not semantic_matching_skus and spec_matching_skus:
-                                print("[CHAT_FLOW] Step 3b: No semantic overlap, falling back to hard spec matches")
-                                semantic_matching_skus = spec_matching_skus
-                                filter_type = "hard_specs"  # Only hard specs matched
-                        
-                        print(f"[CHAT_FLOW] Step 3b result: Found {len(semantic_matching_skus)} matches (semantic + hard specs)")
-                        print(f"[CHAT_FLOW] Filter type used: {filter_type}")
+                                if not semantic_matching_skus and spec_matching_skus:
+                                    print("[CHAT_FLOW] Step 3b: No semantic overlap, falling back to hard spec matches")
+                                    semantic_matching_skus = spec_matching_skus
+                                    filter_type = "hard_specs"  # Only hard specs matched
+                            
+                            print(f"[CHAT_FLOW] Step 3b result: Found {len(semantic_matching_skus)} matches (semantic + hard specs)")
+                            print(f"[CHAT_FLOW] Filter type used: {filter_type}")
+                        else:
+                            print(f"[CHAT_FLOW] Step 3b: SemanticRAG not initialized, skipping semantic search")
                     else:
-                        print(f"[CHAT_FLOW] Step 3b: SemanticRAG not initialized, skipping semantic search")
+                        # Only hard specs, no semantic context - use hard spec filtering directly
+                        print(f"[CHAT_FLOW] Step 3b: Only hard specs provided, skipping semantic search")
+                        
+                        if filter_prefs and self.semantic_rag:
+                            where_filter = self._build_chromadb_where_filter(filter_prefs)
+                            if where_filter:
+                                print(f"[CHAT_FLOW] Step 3b: Using hard spec filters to find products")
+                                semantic_matching_skus = self.semantic_rag.filter_by_specs(where_filter, top_k=31)
+                                filter_type = "hard_specs"
+                                print(f"[CHAT_FLOW] Step 3b result: Found {len(semantic_matching_skus)} matches (hard specs only)")
                 
                 matching_products = []
                 print(f"[CHAT_FLOW] Step 4: Checking context - context={bool(context)}, has products={bool(context and 'products' in context)}")
@@ -1246,9 +1385,15 @@ Generate a natural response that continues the conversation naturally."""
                         else:
                             print(f"[CHAT_FLOW] Step 4: No matches found")
                         print(f"[CHAT_FLOW] Step 4 result: Found {len(matching_products)} matching products")
+                        
+                        # Step 4b: If we have hard specs and matching products, score by closeness to specs
+                        if matching_products and filter_type == "hard_specs" and filter_prefs:
+                            print(f"[CHAT_FLOW] Step 4b: Scoring products by closeness to hard specs")
+                            matching_products = self._score_products_by_specs(matching_products, filter_prefs)
+                        
                         # Log top 3 products to verify order
                         if matching_products:
-                            print(f"[CHAT_FLOW] Top 3 products (in reranked order):")
+                            print(f"[CHAT_FLOW] Top 3 products (in final order):")
                             for i, p in enumerate(matching_products[:3], 1):
                                 print(f"[CHAT_FLOW]   {i}. {p.get('Name')} (SKU: {p.get('SKU')})")
                     else:
@@ -1260,9 +1405,11 @@ Generate a natural response that continues the conversation naturally."""
                 # Check if we have enough prompts to show recommendations
                 if self.product_prompt_count < self.min_prompts_for_recommendation:
                     print(f"[CHAT_FLOW] Not enough prompts yet ({self.product_prompt_count}/{self.min_prompts_for_recommendation}), using clarification response")
-                    # If no matches found, inform user and ask to refine preferences
-                    if not matching_products:
-                        print(f"[CHAT_FLOW] No matching products found during clarification phase - informing user")
+                    # During clarification phase:
+                    # - If we have hard specs but no matches, inform user to refine
+                    # - If we have no hard specs, just ask for clarification (don't say "no matches")
+                    if has_hard_specs and not matching_products:
+                        print(f"[CHAT_FLOW] Hard specs provided but no matches found - informing user")
                         yield from self._generate_no_matches_response(
                             query=user_input,
                             preferences=preferences,
@@ -1270,10 +1417,12 @@ Generate a natural response that continues the conversation naturally."""
                         )
                     else:
                         # Use clarification response to gather more information
+                        # This handles both: no hard specs yet, or hard specs with matches
                         yield from self._generate_clarification_response(
                             query=user_input,
                             preferences=preferences,
-                            semantic_context=self.accumulated_semantic_query
+                            semantic_context=self.accumulated_semantic_query,
+                            matching_products_count=len(matching_products)
                         )
                 else:
                     print(f"[CHAT_FLOW] Sufficient prompts ({self.product_prompt_count}/{self.min_prompts_for_recommendation}), showing recommendations")
