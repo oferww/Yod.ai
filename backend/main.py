@@ -308,14 +308,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     print(f"Context prepared with {len(context['products'])} products", flush=True)
                     
                     # Get the chat response with full context and explicit message history
+                    # chat_stream is now an async generator for non-blocking concurrent connections
                     chat_response = chatbot.chat_stream(
                         user_input=user_message,
                         context=context,
                         message_history=message_history[:-1]
                     )
                     
-                    # Process and send chunks
-                    for i, chunk in enumerate(chat_response):
+                    # Process and send chunks using async for (non-blocking)
+                    # All LLM calls within chat_stream are now async (ainvoke for intermediate, astream for final)
+                    i = 0
+                    async for chunk in chat_response:
                         # Capture time of first chunk (when streaming starts)
                         if i == 0:
                             first_chunk_time_dt = datetime.utcnow()
@@ -330,6 +333,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "is_final": False,
                                 "timestamp": datetime.utcnow().isoformat()
                             })
+                        i += 1
                     
                     # Calculate latency: from user message to first stream chunk
                     if first_chunk_time_dt is None:

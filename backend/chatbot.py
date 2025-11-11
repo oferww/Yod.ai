@@ -30,6 +30,11 @@ class OferGPT:
         # This persists preferences so we don't re-ask for specs already provided
         self.accumulated_preferences = {}
         
+        # Track accumulated raw user prompts for semantic extraction
+        # We extract semantic context from all accumulated prompts only when ready to recommend
+        # This avoids multiple LLM calls and preserves full user intent
+        self.accumulated_user_prompts = []
+        
         # Track accumulated semantic query for reranking (excludes hard spec messages)
         # This ensures we use semantic intent like "deep learning" or "battery life" 
         # for reranking, not hard spec updates like "under $3600"
@@ -387,8 +392,8 @@ class OferGPT:
 
     ### Core chat ###
 
-    def _extract_preferences(self, query: str) -> Dict[str, Any]:
-        """Extract structured hard spec preferences from user query using LLM.
+    async def _extract_preferences(self, query: str) -> Dict[str, Any]:
+        """Extract structured hard spec preferences from user query using LLM (async, non-blocking).
         
         Returns:
             Dict containing any of the following keys if specified:
@@ -428,7 +433,7 @@ class OferGPT:
         
         JSON response:"""
         
-        print(f"[PREF_EXTRACT] Sending to LLM for extraction")
+        print(f"[PREF_EXTRACT] Sending to LLM for extraction (async)")
         
         # Log API call for preference extraction
         provider = os.getenv("LLM_PROVIDER", "cohere").lower()
@@ -439,17 +444,9 @@ class OferGPT:
             self._log_api_call("chat", "GOOGLE_API_KEY", note="preference_extraction")
         
         try:
-            response_text = ""
-            for chunk in self.langchain_llm.stream([HumanMessage(content=prompt)]):
-                chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                if not chunk_text:
-                    continue
-
-                if response_text and chunk_text.startswith(response_text):
-                    response_text += chunk_text[len(response_text):]
-                else:
-                    response_text += chunk_text
-            
+            # Use ainvoke() for non-blocking async calls
+            # This allows the event loop to handle other connections while waiting for the API
+            response_text, token_metadata = await self.llm_provider.ainvoke([HumanMessage(content=prompt)])
             response_text = response_text.strip().strip('`').strip()
             print(f"[PREF_EXTRACT] LLM raw response: '{response_text}'")
 
@@ -482,8 +479,8 @@ class OferGPT:
         print(f"[PREF_EXTRACT] After cleanup: {cleaned if cleaned else 'EMPTY'}")
         return cleaned
     
-    def _extract_semantic_context(self, query: str, conversation_context: str = "") -> str:
-        """Extract semantic preferences as free text using LLM.
+    async def _extract_semantic_context(self, query: str, conversation_context: str = "") -> str:
+        """Extract semantic preferences as free text using LLM (async, non-blocking).
         
         This captures use cases, priorities, tradeoffs, and abstract requirements
         without forcing them into structured fields.
@@ -523,7 +520,7 @@ class OferGPT:
         
         Semantic context:"""
         
-        print(f"[SEMANTIC_EXTRACT] Sending to LLM for extraction")
+        print(f"[SEMANTIC_EXTRACT] Sending to LLM for extraction (async)")
         
         # Log API call for semantic extraction
         provider = os.getenv("LLM_PROVIDER", "cohere").lower()
@@ -534,17 +531,9 @@ class OferGPT:
             self._log_api_call("chat", "GOOGLE_API_KEY", note="semantic_extraction")
         
         try:
-            response_text = ""
-            for chunk in self.langchain_llm.stream([HumanMessage(content=prompt)]):
-                chunk_text = chunk.content if hasattr(chunk, 'content') else str(chunk)
-                if not chunk_text:
-                    continue
-
-                if response_text and chunk_text.startswith(response_text):
-                    response_text += chunk_text[len(response_text):]
-                else:
-                    response_text += chunk_text
-            
+            # Use ainvoke() for non-blocking async calls
+            # This allows the event loop to handle other connections while waiting for the API
+            response_text, token_metadata = await self.llm_provider.ainvoke([HumanMessage(content=prompt)])
             response_text = response_text.strip()
             print(f"[SEMANTIC_EXTRACT] LLM raw response: '{response_text}'")
             
@@ -780,9 +769,9 @@ class OferGPT:
             self.recommendations_given.append(recommendation)
             print(f"[RECOMMENDATION_TRACKED] {len(recommendation['products'])} products recommended (filter_type: {filter_type})")
     
-    def _generate_no_matches_response(self, query: str, preferences: Dict[str, Any], 
-                         semantic_context: str = "") -> Generator[str, None, None]:
-        """Generate a response when no products match the user's preferences.
+    async def _generate_no_matches_response(self, query: str, preferences: Dict[str, Any], 
+                         semantic_context: str = ""):
+        """Generate a response when no products match the user's preferences (async streaming).
         
         This acknowledges the constraints and asks the user to refine their preferences.
         
@@ -836,11 +825,11 @@ Generate a natural, conversational response."""
             max_tokens=800
         )
         
-        # Stream the response
+        # Async stream the response (non-blocking)
         full_response = ""
         chunk_count = 0
-        print(f"[NO_MATCHES_STREAM] Starting to stream no-matches response from LLM", flush=True)
-        for chunk in chat_llm.stream(messages):
+        print(f"[NO_MATCHES_STREAM] Starting to stream no-matches response from LLM (async)", flush=True)
+        async for chunk in chat_llm.astream(messages):
             chunk_count += 1
             full_response += chunk
             yield chunk
@@ -850,9 +839,9 @@ Generate a natural, conversational response."""
         # Add to memory
         self.memory.chat_memory.add_ai_message(full_response)
     
-    def _generate_clarification_response(self, query: str, preferences: Dict[str, Any], 
-                         semantic_context: str = "", matching_products_count: int = 0) -> Generator[str, None, None]:
-        """Generate a conversational response asking for clarification before recommendations.
+    async def _generate_clarification_response(self, query: str, preferences: Dict[str, Any], 
+                         semantic_context: str = "", matching_products_count: int = 0):
+        """Generate a conversational response asking for clarification before recommendations (async streaming).
         
         This is used during the early stages of conversation (before min_prompts_for_recommendation)
         to gather user preferences without showing product recommendations yet.
@@ -949,11 +938,11 @@ Generate a natural response that continues the conversation naturally."""
             max_tokens=800
         )
         
-        # Stream the response
+        # Async stream the response (non-blocking)
         full_response = ""
         chunk_count = 0
-        print(f"[CLARIFICATION_STREAM] Starting to stream clarification response from LLM", flush=True)
-        for chunk in chat_llm.stream(messages):
+        print(f"[CLARIFICATION_STREAM] Starting to stream clarification response from LLM (async)", flush=True)
+        async for chunk in chat_llm.astream(messages):
             chunk_count += 1
             full_response += chunk
             yield chunk
@@ -963,9 +952,9 @@ Generate a natural response that continues the conversation naturally."""
         # Add to memory
         self.memory.chat_memory.add_ai_message(full_response)
     
-    def _generate_recommendation_response(self, query: str, products: List[Dict[str, Any]], preferences: Dict[str, Any], 
-                         context: Optional[Dict] = None, semantic_context: str = "", filter_type: str = "semantic") -> Generator[str, None, None]:
-        """Generate a conversational response based on filtered products.
+    async def _generate_recommendation_response(self, query: str, products: List[Dict[str, Any]], preferences: Dict[str, Any], 
+                         context: Optional[Dict] = None, semantic_context: str = "", filter_type: str = "semantic"):
+        """Generate a conversational response based on filtered products (async streaming).
         
         Args:
             query: Current user query
@@ -1127,12 +1116,12 @@ Generate a natural response that continues the conversation naturally."""
             max_tokens=1000
         )
         
-        # Stream the response
+        # Async stream the response (non-blocking)
         full_response = ""
         chunk_count = 0
-        print(f"[CHAT_STREAM] Starting to stream response from LLM", flush=True)
-        for chunk in chat_llm.stream(messages):
-            # The provider's stream method yields strings directly
+        print(f"[CHAT_STREAM] Starting to stream response from LLM (async)", flush=True)
+        async for chunk in chat_llm.astream(messages):
+            # The provider's astream method yields strings directly
             chunk_count += 1
             full_response += chunk
             # print(f"[CHAT_STREAM] Received chunk {chunk_count}: {len(chunk)} chars, total: {len(full_response)} chars", flush=True)
@@ -1159,9 +1148,9 @@ Generate a natural response that continues the conversation naturally."""
         # Add to memory
         self.memory.chat_memory.add_ai_message(full_response)
         
-    def chat_stream(self, user_input: str, context: Optional[Dict] = None, 
-                   message_history: Optional[List[Dict]] = None) -> Generator[str, None, None]:
-        """Main chat method following the new architecture."""
+    async def chat_stream(self, user_input: str, context: Optional[Dict] = None, 
+                         message_history: Optional[List[Dict]] = None):
+        """Main chat method following the new architecture (async generator for non-blocking concurrency)."""
         # Initialize API counters for this turn
         self._init_api_counts_for_turn()
         
@@ -1213,7 +1202,8 @@ Generate a natural response that continues the conversation naturally."""
                 intent = 'preferences_given'  # Assume user is providing preferences
             else:
                 # Detect user intent (only using current query, not full history to save tokens)
-                intent = self._detect_intent_llm(user_input)
+                # Now async - allows event loop to handle other connections
+                intent = await self._detect_intent_llm(user_input)
                 self._last_detected_intent = intent  # Store for metrics tracking
                 print(f"Detected intent: {intent}")
             
@@ -1226,53 +1216,47 @@ Generate a natural response that continues the conversation naturally."""
             if intent in greeting_intents and not self.accumulated_semantic_query and not self.accumulated_preferences:
                 # For greetings and small talk, just respond without product recommendations
                 print(f"Processing greeting/small talk: {intent}")
-                yield from self.stream_response_with_memory(
+                async for chunk in self.astream_response_with_memory(
                     query=user_input,
                     memory_context=full_context,
                     context=context
-                )
+                ):
+                    yield chunk
                 return
                 
             if intent in preference_intents:
                 print(f"\n[CHAT_FLOW] Processing product intent: {intent}")
                 
-                # Step 1a: Extract technical (hard spec) preferences using LLM
+                # Accumulate raw user prompt for later semantic extraction
+                # This preserves the full user intent without multiple LLM calls
+                self.accumulated_user_prompts.append(user_input)
+                print(f"[CHAT_FLOW] Accumulated user prompt #{len(self.accumulated_user_prompts)}: '{user_input}'")
+                
+                # Step 1a: Extract technical (hard spec) preferences using LLM (async)
                 # Always extract hard specs so we can filter products, even during clarification
                 print(f"[CHAT_FLOW] Step 1a: Extracting hard spec preferences from user input")
-                new_preferences = self._extract_preferences(user_input)
+                new_preferences = await self._extract_preferences(user_input)
                 print(f"[CHAT_FLOW] Step 1a result: {new_preferences if new_preferences else 'NO HARD SPECS FOUND'}")
                 
-                # Step 1b: Extract semantic context only if past clarification phase or have prior context
-                # Defer semantic extraction during clarification to save API calls
-                if in_clarification_phase and not self.accumulated_preferences and not self.accumulated_semantic_query:
-                    print(f"[CHAT_FLOW] In clarification phase - deferring semantic extraction to save API calls")
-                    semantic_context = ""
-                else:
-                    # Step 1b: Extract semantic context as free text
-                    print(f"[CHAT_FLOW] Step 1b: Extracting semantic context from user input")
-                    semantic_context = self._extract_semantic_context(user_input, full_context)
+                # Step 1b: Extract semantic context only when ready to show recommendations
+                # During clarification phase, just accumulate prompts without LLM calls
+                semantic_context = ""
+                if not in_clarification_phase:
+                    # Past clarification phase - extract semantic context from all accumulated prompts
+                    print(f"[CHAT_FLOW] Step 1b: Extracting semantic context from accumulated prompts")
+                    accumulated_prompts_text = " ".join(self.accumulated_user_prompts)
+                    semantic_context = await self._extract_semantic_context(accumulated_prompts_text, full_context)
                     # Ensure semantic_context is a string
                     if semantic_context and not isinstance(semantic_context, str):
                         semantic_context = str(semantic_context)
                     
                     if semantic_context:
                         print(f"[CHAT_FLOW] Step 1b result: '{semantic_context}'")
+                        self.accumulated_semantic_query = semantic_context
                     else:
                         print(f"[CHAT_FLOW] Step 1b result: NO SEMANTIC CONTEXT FOUND")
-                
-                # Accumulate semantic context if found
-                if semantic_context:
-                    # Clean up empty semantic context (just quotes or whitespace)
-                    cleaned_context = semantic_context.strip().strip('"').strip()
-                    if cleaned_context:  # Only accumulate if not empty after cleaning
-                        if self.accumulated_semantic_query:
-                            # Add with single space after period
-                            self.accumulated_semantic_query = f"{self.accumulated_semantic_query} {cleaned_context}"
-                        else:
-                            self.accumulated_semantic_query = cleaned_context
-                        print(f"[CHAT_FLOW] Accumulated semantic query: '{self.accumulated_semantic_query}'")
-                    else:
-                        print(f"[CHAT_FLOW] Semantic context was empty after cleaning, skipping accumulation")
+                else:
+                    print(f"[CHAT_FLOW] In clarification phase ({self.product_prompt_count}/{self.min_prompts_for_recommendation}) - deferring semantic extraction")
                 
                 # Step 2: Merge with accumulated preferences (remember what user already told us)
                 print(f"[CHAT_FLOW] Step 2: Merging with accumulated preferences")
@@ -1410,50 +1394,55 @@ Generate a natural response that continues the conversation naturally."""
                     # - If we have no hard specs, just ask for clarification (don't say "no matches")
                     if has_hard_specs and not matching_products:
                         print(f"[CHAT_FLOW] Hard specs provided but no matches found - informing user")
-                        yield from self._generate_no_matches_response(
+                        async for chunk in self._generate_no_matches_response(
                             query=user_input,
                             preferences=preferences,
                             semantic_context=self.accumulated_semantic_query
-                        )
+                        ):
+                            yield chunk
                     else:
                         # Use clarification response to gather more information
                         # This handles both: no hard specs yet, or hard specs with matches
-                        yield from self._generate_clarification_response(
+                        async for chunk in self._generate_clarification_response(
                             query=user_input,
                             preferences=preferences,
                             semantic_context=self.accumulated_semantic_query,
                             matching_products_count=len(matching_products)
-                        )
+                        ):
+                            yield chunk
                 else:
                     print(f"[CHAT_FLOW] Sufficient prompts ({self.product_prompt_count}/{self.min_prompts_for_recommendation}), showing recommendations")
                     # If no matches found, inform user and ask to refine preferences
                     if not matching_products:
                         print(f"[CHAT_FLOW] No matching products found - informing user to refine preferences")
-                        yield from self._generate_no_matches_response(
+                        async for chunk in self._generate_no_matches_response(
                             query=user_input,
                             preferences=preferences,
                             semantic_context=self.accumulated_semantic_query
-                        )
+                        ):
+                            yield chunk
                     else:
                         # Show recommendations
-                        yield from self._generate_recommendation_response(
+                        async for chunk in self._generate_recommendation_response(
                             query=user_input,
                             products=matching_products,
                             preferences=preferences,
                             context=context,
                             semantic_context=self.accumulated_semantic_query,
                             filter_type=filter_type
-                        )
+                        ):
+                            yield chunk
                 
             else:
                 # For non-product related intents, use the memory-based response
                 print(f"Processing non-product intent: {intent}")
                 # Use the same full_context we constructed (includes message_history) to avoid losing context
-                yield from self.stream_response_with_memory(
+                async for chunk in self.astream_response_with_memory(
                     query=user_input,
                     memory_context=full_context,
                     context=context
-                )
+                ):
+                    yield chunk
                 
         except Exception as e:
             error_msg = f"Error in chat_stream: {str(e)}"
@@ -1507,8 +1496,8 @@ Generate a natural response that continues the conversation naturally."""
         
         return has_trigger_phrase and has_context
 
-    def _detect_intent_llm(self, query: str, memory_context=None) -> str:
-        """Use the LLM to classify high-level intent for product recommendations.
+    async def _detect_intent_llm(self, query: str, memory_context=None) -> str:
+        """Use the LLM to classify high-level intent for product recommendations (async, non-blocking).
 
         Args:
             query: The user's query (only this is used for intent detection)
@@ -1570,7 +1559,7 @@ Generate a natural response that continues the conversation naturally."""
                 "Respond ONLY with the intent word (one word, lowercase, no punctuation)."
             )
             
-            print(f"[INTENT_LLM] Sending to LLM for classification")
+            print(f"[INTENT_LLM] Sending to LLM for classification (async)")
             
             # Get a key for the LLM call and log the API call
             provider = os.getenv("LLM_PROVIDER", "cohere").lower()
@@ -1587,14 +1576,10 @@ Generate a natural response that continues the conversation naturally."""
                 max_tokens=10
             )
             
-            # Call the LLM using stream to avoid token_count issues
-            print(f"[INTENT_LLM] Calling LLM with stream method")
-            response_text = ""
+            # Call the LLM using ainvoke() for non-blocking async calls
+            print(f"[INTENT_LLM] Calling LLM with ainvoke method (async)")
             try:
-                for chunk in _intent_llm.stream([HumanMessage(content=instruction)]):
-                    # The provider's stream method yields strings directly
-                    response_text += chunk
-                
+                response_text, token_metadata = await _intent_llm.ainvoke([HumanMessage(content=instruction)])
                 response_text = response_text.strip().lower()
                 print(f"[INTENT_LLM] LLM raw response: '{response_text}'")
             except Exception as response_error:
@@ -1625,6 +1610,110 @@ Generate a natural response that continues the conversation naturally."""
             return 'greeting'  # Default to greeting on error
 
     ### Generation (LLM output) ###
+
+    async def astream_response_with_memory(self, query: str, memory_context: str = "", context: Optional[Dict] = None):
+        """Generate async streaming response using LangChain with conversation memory.
+        
+        This is the async version used for user-facing responses. It uses astream() for non-blocking
+        concurrent WebSocket connections.
+        
+        Args:
+            query: The user's message
+            memory_context: Summary of previous conversation
+            context: Additional context (e.g., product info)
+        """
+        import time
+        try:
+            print("🔄 Starting async response generation...", flush=True)
+            # Truncate memory to stay within token limits
+            try:
+                mem_budget = int(os.getenv("OFERGPT_MEMORY_CHAR_BUDGET", "700"))
+            except Exception:
+                mem_budget = 700
+                
+            mem_text = memory_context if memory_context else "This is the start of our conversation."
+            mem_text = self._truncate(mem_text, mem_budget)
+            
+            # Check if we have enough information to recommend products
+            has_sufficient_info = self._check_sufficient_info(query, mem_text)
+            
+            # Prepare the base prompt
+            base_prompt = self.system_prompt
+            
+            # Only include product details if we have sufficient information
+            if has_sufficient_info and context and 'products' in context:
+                base_prompt += f"\n\nAvailable products for recommendation:\n{context['products']}"
+            
+            prompt = f"{base_prompt}\n\nPrevious conversation summary:\n{mem_text}\n\nUser question: {query}\n\nPlease provide a helpful response based on our previous conversation:"
+            try:
+                print("🚀 Starting async LangChain streaming...", flush=True)
+                # Real-time streaming only; global timeout is enforced by the caller (frontend)
+                full_response = ""
+                token_count = 0
+                
+                # Determine if we should use key rotation (Cohere only)
+                provider = os.getenv("LLM_PROVIDER", "cohere").lower()
+                max_tries = self._keybank.key_count() if provider == "cohere" else 1
+                last_err = None
+                
+                for _ in range(max_tries):
+                    # For Google, get API key once; for Cohere, rotate through keys
+                    if provider == "cohere":
+                        _stream_key, _stream_idx = self._keybank.get_key_with_index("chat_stream")
+                        self._log_api_call("chat", "COHERE_API_KEY", note="chat_stream", key_index=_stream_idx)
+                    else:
+                        _stream_key = self._get_api_key_for_provider()
+                        _stream_idx = None
+                        self._log_api_call("chat", "GOOGLE_API_KEY", note="chat_stream")
+                    
+                    _stream_llm = self._create_llm_instance(
+                        api_key=_stream_key,
+                        temperature=0.35,
+                        max_tokens=300
+                    )
+                    try:
+                        async for chunk in _stream_llm.astream([HumanMessage(content=prompt)]):
+                            # The provider's astream method yields strings directly
+                            if chunk:
+                                full_response += chunk
+                                token_count += 1
+                                yield chunk
+                        print(f"✅ Async streaming completed: {token_count} chunks", flush=True)
+                        if token_count == 0:
+                            raise RuntimeError("Async streaming returned 0 chunks; forcing fallback to non-streaming generation.")
+                        # Save assistant response to memory so future turns have context
+                        try:
+                            if full_response:
+                                self.memory.chat_memory.add_ai_message(full_response)
+                        except Exception:
+                            pass
+                        break
+                    except Exception as e:
+                        last_err = e
+                        try:
+                            error_msg = f"[CHAT][ERROR] note=chat_stream"
+                            if _stream_idx is not None:
+                                error_msg += f" key_index={_stream_idx}"
+                            error_msg += f" error={e}"
+                            print(error_msg, flush=True)
+                        except Exception:
+                            pass
+                        # Only penalize Cohere keys
+                        if provider == "cohere" and _stream_idx is not None:
+                            try:
+                                self._keybank.penalize_key(_stream_idx, seconds=1.5)
+                            except Exception:
+                                pass
+                        continue
+                else:
+                    raise RuntimeError(f"async_stream_failed_all_keys: {last_err}")
+            except Exception as stream_error:
+                print(f"❌ Async streaming failed: {stream_error}", flush=True)
+                # Remove simulated streaming fallback; propagate to outer handler
+                raise
+        except Exception as e:
+            print(f"Error generating async streaming response: {e}", flush=True)
+            raise
 
     def stream_response_with_memory(self, query: str, memory_context: str = "", context: Optional[Dict] = None):
         """Generate streaming response using LangChain with conversation memory.

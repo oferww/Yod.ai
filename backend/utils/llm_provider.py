@@ -7,7 +7,8 @@ The provider is selected via the LLM_PROVIDER environment variable.
 
 import os
 import logging
-from typing import Generator, Optional, List, Dict, Any
+import asyncio
+from typing import Generator, AsyncGenerator, Optional, List, Dict, Any
 from abc import ABC, abstractmethod
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 
@@ -30,8 +31,34 @@ class BaseLLMProvider(ABC):
         pass
     
     @abstractmethod
+    async def astream(self, messages: List[BaseMessage]) -> AsyncGenerator[str, None]:
+        """Async stream responses from the LLM.
+        
+        Args:
+            messages: List of messages (SystemMessage, HumanMessage, etc.)
+            
+        Yields:
+            str: Chunks of the response text
+        """
+        pass
+    
+    @abstractmethod
     def invoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
         """Get a complete response from the LLM (non-streaming).
+        
+        Args:
+            messages: List of messages (SystemMessage, HumanMessage, etc.)
+            
+        Returns:
+            tuple: (response_text, token_metadata) where token_metadata contains:
+                - input_tokens: Number of prompt tokens
+                - output_tokens: Number of response tokens
+        """
+        pass
+    
+    @abstractmethod
+    async def ainvoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Get a complete response from the LLM asynchronously (non-streaming, non-blocking).
         
         Args:
             messages: List of messages (SystemMessage, HumanMessage, etc.)
@@ -100,6 +127,27 @@ class CohereLLMProvider(BaseLLMProvider):
                 yield content
         print(f"[COHERE_STREAM] Stream complete. Total chunks: {chunk_count}, Final token counts: {self._last_token_counts}", flush=True)
     
+    async def astream(self, messages: List[BaseMessage]) -> AsyncGenerator[str, None]:
+        """Async stream responses from Cohere."""
+        print("[COHERE_ASTREAM] Starting async stream", flush=True)
+        chunk_count = 0
+        async for chunk in self.llm.astream(messages):
+            content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+            if content:
+                chunk_count += 1
+                # Extract token counts from chunk if available
+                if hasattr(chunk, 'additional_kwargs') and 'token_count' in chunk.additional_kwargs:
+                    token_info = chunk.additional_kwargs['token_count']
+                    self._last_token_counts = {
+                        'input_tokens': token_info.get('prompt_tokens', 0),
+                        'output_tokens': token_info.get('response_tokens', 0),
+                    }
+                    print(f"[COHERE_ASTREAM] Chunk {chunk_count}: Extracted tokens - input={self._last_token_counts['input_tokens']}, output={self._last_token_counts['output_tokens']}", flush=True)
+                else:
+                    print(f"[COHERE_ASTREAM] Chunk {chunk_count}: No token_count in additional_kwargs", flush=True)
+                yield content
+        print(f"[COHERE_ASTREAM] Stream complete. Total chunks: {chunk_count}, Final token counts: {self._last_token_counts}", flush=True)
+    
     def invoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
         """Get complete response from Cohere."""
         print("[COHERE_INVOKE] Starting invoke", flush=True)
@@ -120,6 +168,28 @@ class CohereLLMProvider(BaseLLMProvider):
             print("[COHERE_INVOKE] No token_count in response.additional_kwargs", flush=True)
         
         print(f"[COHERE_INVOKE] Invoke complete. Response length: {len(response_text)}, Token metadata: {token_metadata}", flush=True)
+        return response_text, token_metadata
+    
+    async def ainvoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Get complete response from Cohere asynchronously (non-blocking)."""
+        print("[COHERE_AINVOKE] Starting async invoke", flush=True)
+        response = await self.llm.ainvoke(messages)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Extract token counts from response
+        token_metadata = None
+        if hasattr(response, 'additional_kwargs') and 'token_count' in response.additional_kwargs:
+            token_info = response.additional_kwargs['token_count']
+            token_metadata = {
+                'input_tokens': token_info.get('prompt_tokens', 0),
+                'output_tokens': token_info.get('response_tokens', 0),
+            }
+            self._last_token_counts = token_metadata
+            print(f"[COHERE_AINVOKE] Extracted tokens - input={token_metadata['input_tokens']}, output={token_metadata['output_tokens']}", flush=True)
+        else:
+            print("[COHERE_AINVOKE] No token_count in response.additional_kwargs", flush=True)
+        
+        print(f"[COHERE_AINVOKE] Async invoke complete. Response length: {len(response_text)}, Token metadata: {token_metadata}", flush=True)
         return response_text, token_metadata
     
     def get_token_counts(self) -> Optional[Dict[str, Any]]:
@@ -186,6 +256,31 @@ class GoogleAIProvider(BaseLLMProvider):
             print(f"[GOOGLE_STREAM] ERROR during streaming: {e}", flush=True)
             raise
     
+    async def astream(self, messages: List[BaseMessage]) -> AsyncGenerator[str, None]:
+        """Async stream responses from Google AI.
+        
+        Note: Google's streaming API does not provide token counts in chunks.
+        Token counts are retrieved after streaming completes via invoke().
+        """
+        print("[GOOGLE_ASTREAM] Starting async stream", flush=True)
+        chunk_count = 0
+        total_chars = 0
+        # Store messages for later token count retrieval
+        self._last_messages = messages
+        try:
+            async for chunk in self.llm.astream(messages):
+                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if content:
+                    chunk_count += 1
+                    total_chars += len(content)
+                    print(f"[GOOGLE_ASTREAM] Chunk {chunk_count}: {len(content)} chars, total: {total_chars} chars", flush=True)
+                    yield content
+            print(f"[GOOGLE_ASTREAM] Stream complete. Total chunks: {chunk_count}, Total chars: {total_chars}", flush=True)
+            print(f"[GOOGLE_ASTREAM] Note: Token counts will be retrieved via invoke() after streaming", flush=True)
+        except Exception as e:
+            print(f"[GOOGLE_ASTREAM] ERROR during async streaming: {e}", flush=True)
+            raise
+    
     def invoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
         """Get complete response from Google AI."""
         print("[GOOGLE_INVOKE] Starting invoke", flush=True)
@@ -205,6 +300,27 @@ class GoogleAIProvider(BaseLLMProvider):
             print("[GOOGLE_INVOKE] No usage_metadata in response", flush=True)
         
         print(f"[GOOGLE_INVOKE] Invoke complete. Response length: {len(response_text)}, Token metadata: {token_metadata}", flush=True)
+        return response_text, token_metadata
+    
+    async def ainvoke(self, messages: List[BaseMessage]) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Get complete response from Google AI asynchronously (non-blocking)."""
+        print("[GOOGLE_AINVOKE] Starting async invoke", flush=True)
+        response = await self.llm.ainvoke(messages)
+        response_text = response.content if hasattr(response, 'content') else str(response)
+        
+        # Extract token counts from response (usage_metadata)
+        token_metadata = None
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            token_metadata = {
+                'input_tokens': response.usage_metadata.get('input_tokens', 0),
+                'output_tokens': response.usage_metadata.get('output_tokens', 0),
+            }
+            self._last_token_counts = token_metadata
+            print(f"[GOOGLE_AINVOKE] Extracted tokens - input={token_metadata['input_tokens']}, output={token_metadata['output_tokens']}", flush=True)
+        else:
+            print("[GOOGLE_AINVOKE] No usage_metadata in response", flush=True)
+        
+        print(f"[GOOGLE_AINVOKE] Async invoke complete. Response length: {len(response_text)}, Token metadata: {token_metadata}", flush=True)
         return response_text, token_metadata
     
     def get_token_counts(self) -> Optional[Dict[str, Any]]:
